@@ -20,6 +20,14 @@ window, dialog { background-color: @theme_base_color; }
 .heading { font-weight: 600; font-size: 1.1em; }
 """
 
+SYSTEM_APP_DIRS = [
+    pathlib.Path.home()/'.local/share/applications',
+    pathlib.Path('/usr/local/share/applications'),
+    pathlib.Path('/usr/share/applications'),
+    pathlib.Path('/var/lib/flatpak/exports/share/applications'),
+    pathlib.Path.home()/'.local/share/flatpak/exports/share/applications'
+]
+
 class DesktopEntry:
     def __init__(self, path: pathlib.Path):
         self.path = path
@@ -46,43 +54,160 @@ class DesktopEntry:
     def is_custom(self):
         return self.data.get(CUSTOM_MARKER_KEY) == CUSTOM_MARKER_VALUE
 
+    def is_local(self):
+        try:
+            return str(self.path).startswith(str(LOCAL_APPS))
+        except Exception:
+            return False
+
     def display_name(self):
         return self.data.get('Name', self.path.name)
 
     def icon_name(self):
         return self.data.get('Icon')
 
+    def is_hidden(self):
+        val_hidden = self.data.get('Hidden','').lower() == 'true'
+        val_nodisplay = self.data.get('NoDisplay','').lower() == 'true'
+        return val_hidden or val_nodisplay
+
 class AppListRow(Adw.ActionRow):
     __gtype_name__ = 'AppListRow'
-    def __init__(self, entry: DesktopEntry):
+    def __init__(self, entry: DesktopEntry, parent_win: 'AppWindow'):
         super().__init__()
         self.entry = entry
+        self.parent_win = parent_win
         self.set_title(entry.display_name())
         if entry.icon_name():
             self.add_prefix(Gtk.Image.new_from_icon_name(entry.icon_name()))
-        # Edit button
-        edit_btn = Gtk.Button.new_from_icon_name('document-edit-symbolic')
-        edit_btn.set_tooltip_text('Edit')
-        edit_btn.connect('clicked', self.on_edit)
-        self.add_suffix(edit_btn)
-        # Remove button
-        rm_btn = Gtk.Button.new_from_icon_name('user-trash-symbolic')
-        rm_btn.add_css_class('destructive-action')
-        rm_btn.set_tooltip_text('Delete')
-        rm_btn.connect('clicked', self.on_remove)
-        self.add_suffix(rm_btn)
+        # State badges
+        if entry.is_custom():
+            if parent_win.has_system_counterpart(entry.path.name):
+                badge = Gtk.Label(label='OVERRIDE'); badge.add_css_class('warning'); self.add_prefix(badge)
+            if entry.is_hidden():
+                hidden_badge = Gtk.Label(label='HIDDEN'); hidden_badge.add_css_class('danger'); self.add_prefix(hidden_badge)
+        # Action buttons
+        if entry.is_custom():
+            # Edit
+            edit_btn = Gtk.Button.new_from_icon_name('document-edit-symbolic'); edit_btn.set_tooltip_text('Edit'); edit_btn.connect('clicked', self.on_edit); self.add_suffix(edit_btn)
+            # Unhide if hidden
+            if entry.is_hidden():
+                unhide_btn = Gtk.Button.new_from_icon_name('view-refresh-symbolic'); unhide_btn.set_tooltip_text('Unhide'); unhide_btn.connect('clicked', self.on_unhide); self.add_suffix(unhide_btn)
+            # Revert override if there is system counterpart
+            if parent_win.has_system_counterpart(entry.path.name):
+                revert_btn = Gtk.Button.new_from_icon_name('edit-undo-symbolic'); revert_btn.set_tooltip_text('Revert override'); revert_btn.connect('clicked', self.on_revert); self.add_suffix(revert_btn)
+            # Delete (only removes local file)
+            rm_btn = Gtk.Button.new_from_icon_name('user-trash-symbolic'); rm_btn.add_css_class('destructive-action'); rm_btn.set_tooltip_text('Delete'); rm_btn.connect('clicked', self.on_remove); self.add_suffix(rm_btn)
+        else:
+            # Non-custom system/flatpak entry: allow Hide + Override & Edit
+            hide_btn = Gtk.Button.new_from_icon_name('window-close-symbolic'); hide_btn.set_tooltip_text('Hide (create Hidden override)'); hide_btn.connect('clicked', self.on_hide); self.add_suffix(hide_btn)
+            override_btn = Gtk.Button.new_from_icon_name('document-edit-symbolic'); override_btn.set_tooltip_text('Override & Edit (creates local copy)'); override_btn.connect('clicked', self.on_override_edit); self.add_suffix(override_btn)
 
     def on_edit(self, *_):
-        parent_win = self.get_ancestor(AppWindow)
-        if parent_win:
-            EditDesktopWindow(parent_win, self.entry).present()
+        EditDesktopWindow(self.get_ancestor(AppWindow), self.entry).present()
+
+    def on_clone(self, *_):
+        win = self.get_ancestor(AppWindow)
+        if not win: return
+        try:
+            contents = self.entry.path.read_text(encoding='utf-8')
+            if f'{CUSTOM_MARKER_KEY}=' not in contents:
+                contents += f'\n{CUSTOM_MARKER_KEY}={CUSTOM_MARKER_VALUE}\n'
+            target = LOCAL_APPS / self.entry.path.name
+            base = target.stem; counter = 1
+            while target.exists():
+                target = LOCAL_APPS / f"{base}-{counter}.desktop"; counter += 1
+            LOCAL_APPS.mkdir(parents=True, exist_ok=True)
+            target.write_text(contents, encoding='utf-8')
+            win.toast_overlay.add_toast(Adw.Toast.new('Cloned'))
+            win.reload_list()
+            # Open edit on cloned one
+            cloned_entry = DesktopEntry(target)
+            GLib.idle_add(lambda: EditDesktopWindow(win, cloned_entry).present())
+        except Exception as e:
+            win.toast_overlay.add_toast(Adw.Toast.new(f'Clone failed: {e}'))
 
     def on_remove(self, *_):
         # Replace AlertDialog (was not functioning) with explicit confirmation window
         parent_win = self.get_ancestor(AppWindow)
-        if not parent_win:
-            return
+        if not parent_win: return
         ConfirmDeleteWindow(parent_win, self.entry).present()
+
+    def on_override_edit(self, *_):
+        win = self.get_ancestor(AppWindow)
+        if not win: return
+        try:
+            contents = self.entry.path.read_text(encoding='utf-8')
+            if f'{CUSTOM_MARKER_KEY}=' not in contents:
+                contents += f'\n{CUSTOM_MARKER_KEY}={CUSTOM_MARKER_VALUE}\n'
+            target = LOCAL_APPS / self.entry.path.name
+            base = target.stem; counter = 1
+            while target.exists():
+                # If an existing override (already custom) then just open
+                existing_entry = DesktopEntry(target)
+                if existing_entry.is_custom():
+                    EditDesktopWindow(win, existing_entry).present(); return
+                target = LOCAL_APPS / f"{base}-{counter}.desktop"; counter += 1
+            LOCAL_APPS.mkdir(parents=True, exist_ok=True)
+            target.write_text(contents, encoding='utf-8')
+            win.toast_overlay.add_toast(Adw.Toast.new('Override created'))
+            win.reload_list()
+            overridden = DesktopEntry(target)
+            GLib.idle_add(lambda: EditDesktopWindow(win, overridden).present())
+        except Exception as e:
+            win.toast_overlay.add_toast(Adw.Toast.new(f'Override failed: {e}'))
+
+    def on_revert(self, *_):
+        # Delete local override only (keep system entry)
+        try:
+            if self.entry.path.exists():
+                self.entry.path.unlink()
+            self.parent_win.toast_overlay.add_toast(Adw.Toast.new('Override reverted'))
+        except Exception as e:
+            self.parent_win.toast_overlay.add_toast(Adw.Toast.new(f'Revert failed: {e}'))
+        self.parent_win.reload_list()
+
+    def on_hide(self, *_):
+        """Create a local override with Hidden=true (acts like delete)."""
+        win = self.get_ancestor(AppWindow)
+        if not win: return
+        try:
+            contents = self.entry.path.read_text(encoding='utf-8')
+            if '[Desktop Entry]' not in contents:
+                win.toast_overlay.add_toast(Adw.Toast.new('Invalid desktop file'))
+                return
+            if 'Hidden=' in contents or 'NoDisplay=' in contents:
+                # Already has hidden marker upstream; still clone to ensure local override
+                pass
+            if f'{CUSTOM_MARKER_KEY}=' not in contents:
+                contents += f'\n{CUSTOM_MARKER_KEY}={CUSTOM_MARKER_VALUE}'
+            if 'Hidden=' not in contents and 'NoDisplay=' not in contents:
+                contents += '\nHidden=true'
+            target = LOCAL_APPS / self.entry.path.name
+            base = target.stem; counter = 1
+            while target.exists() and not DesktopEntry(target).is_custom():
+                target = LOCAL_APPS / f"{base}-{counter}.desktop"; counter += 1
+            LOCAL_APPS.mkdir(parents=True, exist_ok=True)
+            target.write_text(contents + '\n', encoding='utf-8')
+            win.toast_overlay.add_toast(Adw.Toast.new('Hidden (override created)'))
+            win.reload_list()
+        except Exception as e:
+            win.toast_overlay.add_toast(Adw.Toast.new(f'Hide failed: {e}'))
+
+    def on_unhide(self, *_):
+        win = self.get_ancestor(AppWindow)
+        if not win: return
+        try:
+            lines = self.entry.path.read_text(encoding='utf-8').splitlines()
+            filtered = [l for l in lines if not l.startswith('Hidden=') and not l.startswith('NoDisplay=')]
+            if filtered == lines:
+                win.toast_overlay.add_toast(Adw.Toast.new('Not hidden'))
+                return
+            self.entry.path.write_text('\n'.join(filtered)+'\n', encoding='utf-8')
+            win.toast_overlay.add_toast(Adw.Toast.new('Unhidden'))
+            win.reload_list()
+        except Exception as e:
+            win.toast_overlay.add_toast(Adw.Toast.new(f'Unhide failed: {e}'))
 
 class AddDesktopWindow(Gtk.Window):
     def __init__(self, parent_win: 'AppWindow'):
@@ -219,6 +344,28 @@ class AddDesktopWindow(Gtk.Window):
         exec_cmd = self._build_exec_command()
         if not exec_cmd:
             self._toast('Exec could not be built'); return
+        # Duplicate detection by Exec command
+        existing_custom = self.parent_win.find_custom_by_exec(exec_cmd)
+        if existing_custom:
+            self._toast('Already exists – opening for edit')
+            EditDesktopWindow(self.parent_win, existing_custom).present()
+            self.close(); return
+        existing_system = self.parent_win.find_system_by_exec(exec_cmd)
+        if existing_system:
+            self._toast('System app already runs this – use Override & Edit from All Apps')
+            return
+        # Also prevent duplicate name file (same sanitized base)
+        fname_candidate = ''.join(c for c in name if c.isalnum() or c in ('-','_')).replace(' ','') or 'custom'
+        possible = LOCAL_APPS / f"{fname_candidate}.desktop"
+        if possible.exists():
+            try:
+                existing_entry = DesktopEntry(possible)
+                if existing_entry.is_custom():
+                    self._toast('Name already used – opening existing')
+                    EditDesktopWindow(self.parent_win, existing_entry).present(); self.close(); return
+            except Exception:
+                pass
+        # Proceed with creation
         # possibly mark executable
         if self.exec_perm_switch.get_active():
             try: st = os.stat(self.exec_path); os.chmod(self.exec_path, st.st_mode | 0o111)
@@ -451,6 +598,23 @@ class AppWindow(Adw.ApplicationWindow):
         scroller.set_hexpand(True); scroller.set_vexpand(True)
         vbox.append(scroller)
 
+        self.show_all = False
+        # Toggle button to show all apps
+        self.toggle_all_btn = Gtk.Button.new_with_label('All Apps')
+        self.toggle_all_btn.set_tooltip_text('Toggle between custom and all applications')
+        self.toggle_all_btn.connect('clicked', self.on_toggle_all)
+        header.pack_end(self.toggle_all_btn)
+        # Optional search entry
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text('Search...')
+        self.search_entry.connect('search-changed', lambda *_: self.reload_list())
+        header.pack_end(self.search_entry)
+
+        self.reload_list()
+
+    def on_toggle_all(self, *_):
+        self.show_all = not self.show_all
+        self.toggle_all_btn.set_label('Custom Only' if self.show_all else 'All Apps')
         self.reload_list()
 
     def reload_list(self):
@@ -460,16 +624,66 @@ class AppWindow(Adw.ApplicationWindow):
             next_child = child.get_next_sibling()
             self.list_box.remove(child)
             child = next_child
+        query = (self.search_entry.get_text().strip().lower() if hasattr(self, 'search_entry') else '')
         entries = []
-        if LOCAL_APPS.exists():
-            for p in LOCAL_APPS.glob('*.desktop'):
+        seen = set()
+        dirs = SYSTEM_APP_DIRS if self.show_all else [LOCAL_APPS]
+        for d in dirs:
+            if not d or not d.exists():
+                continue
+            for p in d.glob('*.desktop'):
+                name_key = p.name
+                # User/local overrides take precedence, skip if already seen
+                if name_key in seen:
+                    continue
                 entry = DesktopEntry(p)
-                if entry.is_custom():
-                    entries.append(entry)
+                if not self.show_all and not entry.is_custom():
+                    continue
+                if query and query not in entry.display_name().lower():
+                    continue
+                entries.append(entry)
+                seen.add(name_key)
         entries.sort(key=lambda e: e.display_name().lower())
         for e in entries:
-            self.list_box.append(AppListRow(e))
-        self.status_label.set_text(f'Custom Launchers: {len(entries)}')
+            self.list_box.append(AppListRow(e, self))
+        self.status_label.set_text(f"{'All' if self.show_all else 'Custom'} Apps: {len(entries)}")
+
+    def has_system_counterpart(self, filename: str) -> bool:
+        for d in SYSTEM_APP_DIRS:
+            if d == LOCAL_APPS: continue
+            p = d / filename
+            if p.exists():
+                return True
+        return False
+
+    def find_custom_by_exec(self, exec_cmd: str):
+        norm = exec_cmd.strip()
+        if not norm:
+            return None
+        if LOCAL_APPS.exists():
+            for p in LOCAL_APPS.glob('*.desktop'):
+                try:
+                    e = DesktopEntry(p)
+                    if e.is_custom() and e.data.get('Exec','').strip() == norm:
+                        return e
+                except Exception:
+                    pass
+        return None
+    def find_system_by_exec(self, exec_cmd: str):
+        norm = exec_cmd.strip()
+        if not norm:
+            return None
+        for d in SYSTEM_APP_DIRS:
+            if not d.exists() or d == LOCAL_APPS:
+                continue
+            for p in d.glob('*.desktop'):
+                try:
+                    e = DesktopEntry(p)
+                    if e.data.get('Exec','').strip() == norm:
+                        return e
+                except Exception:
+                    pass
+        return None
 
 class App(Adw.Application):
     def __init__(self):
